@@ -374,6 +374,14 @@ public class UncertainDatabase {
         // Build vertical database for efficient mining
         db.buildVerticalDatabase();
 
+        // Set database name from filename
+        String name = filename;
+        int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (slash >= 0) name = name.substring(slash + 1);
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) name = name.substring(0, dot);
+        db.setName(name.replace("_uncertain", ""));
+
         return db;
     }
 
@@ -415,7 +423,8 @@ public class UncertainDatabase {
 
             // Extract item name and probability
             String itemName = itemProb[0];
-            double prob = Double.parseDouble(itemProb[1]);
+            String probStr = itemProb[1].replace(',', '.');
+            double prob = Double.parseDouble(probStr);
 
             // Get/create item index from vocabulary
             int itemIndex = vocab.getOrCreateIndex(itemName);
