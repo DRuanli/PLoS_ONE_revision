@@ -11,61 +11,55 @@ import java.util.*;
 
 /**
  * ITUFP — Interactive Top-K Uncertain Frequent Pattern mining
- * (FAIR-COMPARISON ADAPTATION).
+ * (ADAPTED to TUFCI's problem: top-k probabilistic frequent closed itemset mining).
  *
- * Adapted from:
- *   Davashi, R.
- *   "ITUFP: A fast method for interactive mining of Top-K frequent patterns
- *    from uncertain data."
- *   Expert Systems with Applications 214, 119156 (2023).
- *   DOI: 10.1016/j.eswa.2022.119156
+ * Reference:
+ *   Davashi, R. "ITUFP: A fast method for interactive mining of Top-K frequent
+ *   patterns from uncertain data." ESWA 214, 119156 (2023).
  *
- * <h2>Original Algorithm</h2>
- * ITUFP introduces:
- *   - <b>UP-List</b>: per-item (tid, prob) list — equivalent to a probabilistic
- *     tidset, built in a single database scan.
- *   - <b>IMCUP-List</b>: per-itemset cumulative-probability list supporting
- *     fast incremental update when k changes.
- * The algorithm performs DFS expansion in <b>support-descending</b> order over
- * UP-Lists. It does NOT enforce closedness.
+ * <h2>EXACTNESS NOTE — Critical Implementation Detail</h2>
+ * In the original paper, ITUFP uses <em>expected support</em> which is additive
+ * per-tuple. This means combining IMCUP-Lists by intersection (multiplying
+ * per-tuple probabilities) is mathematically valid for expSup.
  *
- * <h2>Fair-Comparison Adaptation</h2>
- * <ol>
- *   <li><b>Disable interactive re-mining.</b> We run ITUFP as a one-shot top-k
- *       miner. The IMCUP-List benefit only applies when k changes mid-session,
- *       which is irrelevant to a static-k benchmark. We emulate the IMCUP-List
- *       structure during mining (so the memory profile is faithful) but skip
- *       the persistent caching across runs.</li>
- *   <li><b>Closure post-filter (in-buffer only).</b> Same approach as TopKPFIM:
- *       mine 2k probabilistic frequent itemsets, then post-filter for closedness
- *       using only buffer comparisons (no extra tidset intersections).</li>
- *   <li><b>Same uncertainty model and infrastructure.</b> Reuse
- *       {@code UncertainDatabase}, {@code Tidset}, {@code SupportCalculator}.</li>
- *   <li><b>UP-Lists ≡ probabilistic tidsets.</b> Davashi's UP-Lists store
- *       (tid, prob) pairs identical to our {@code Tidset} contents.</li>
- * </ol>
+ * For TUFCI's problem (probabilistic support, requires the full distribution),
+ * naive intersection of two derived IMCUP-Lists DOUBLE-COUNTS shared items'
+ * probabilities. E.g., combining {A,B} with {A,C} via tidset intersection
+ * gives entries with prob = P(A)·P(B) · P(A)·P(C) = P(A)²·P(B)·P(C), which
+ * is wrong; the correct combined probability is P(A)·P(B)·P(C).
  *
- * <h2>Why ITUFP Loses to TUFCI (legitimate, structural reasons)</h2>
+ * <b>Fix</b>: when extending an IMCUP-List X with one more item y to form
+ * X∪{y}, we always intersect X.tidset with the fresh singleton tidset
+ * {y}.tidset (which contains only P(y), not products). This yields exact
+ * probabilistic support and matches TUFCI's ground truth.
+ *
+ * The recursive DFS structure of ITUFP_growth still walks the prefix-tree
+ * exactly once per itemset; we just look up the correct singleton tidset
+ * for each extension rather than reusing a sibling IMCUP-List.
+ *
+ * <h2>What Is Faithful to the Paper</h2>
  * <ul>
- *   <li><b>DFS, not best-first.</b> Even with support-descending item ordering,
- *       DFS commits to a branch before evaluating siblings.</li>
- *   <li><b>No native closedness.</b> Same penalty as TopKPFIM.</li>
- *   <li><b>IMCUP-List bookkeeping is wasted in static-k.</b> The structure
- *       exists for the interactive use case; allocating it adds memory pressure
- *       with no payoff in our setting.</li>
- *   <li><b>No safe early termination.</b> DFS cannot terminate when remaining
- *       frontier provably cannot improve top-k.</li>
+ *   <li>UP-List per item with Max header (Section 3.3.1).</li>
+ *   <li>IMCUP-List per itemset with Index1, Index2 (Definition 5).</li>
+ *   <li>Items sorted DESC by support (Algorithm Fig. 7 line 2).</li>
+ *   <li>PUFP technique: (u_x.support × max_prob(u_l)) > minSup (line 7).</li>
+ *   <li>Recursive divide-and-conquer (Mine_Patterns + ITUFP_growth, Fig. 8).</li>
+ *   <li>Tᵏ array with raised minSup (Fig. 7 lines 5-8).</li>
  * </ul>
  *
- * <h2>Performance Audit Notes</h2>
- * Earlier draft had three fairness bugs that were fixed in this revision:
- * <ol>
- *   <li>Closure post-filter computed extra tidset intersections per candidate.
- *       →  Removed; closure is in-buffer only.</li>
- *   <li>Buffer maintained by full-sort on every insert. →  Min-heap, O(log N).</li>
- *   <li>Hot path used HashMap lookups for parent/item caches.
- *       →  Switched to direct reference passing (cached tidset arg).</li>
- * </ol>
+ * <h2>What Is Adapted</h2>
+ * <ul>
+ *   <li><b>Support definition</b>: probabilistic support Λᵖᵣ instead of expSup,
+ *       computed via TUFCI's DirectConvolutionSupportCalculator (same problem).</li>
+ *   <li><b>Tidset extension via singleton</b>: extend IMCUP-List(X) with item y
+ *       by intersecting X.tidset with the level-1 singleton tidset of y. This
+ *       is mathematically equivalent to the paper's operation under expSup,
+ *       but exact under probabilistic support.</li>
+ *   <li><b>ppf removed</b>: paper's ppf early-termination is sound only for
+ *       additive measures. For probabilistic support, truncated tidsets give
+ *       wrong supports for descendants. PUFP alone is sound and retained.</li>
+ *   <li><b>Closure post-filter</b>: in-buffer subset check on FFIC of size 2k.</li>
+ * </ul>
  *
  * @author Adapted by Le, Vo, Nguyen for PONE-D-26-07832 revision
  */
@@ -77,46 +71,53 @@ public class ITUFP {
     private final SupportCalculator calculator;
     private final Vocabulary vocab;
 
-    private static final int OVER_FACTOR = 2;
+    private static final int OVER_FACTOR = 3;
 
-    /**
-     * IMCUP-List proxy — Davashi's per-itemset cumulative entry. Allocated
-     * during mining to faithfully model ITUFP's memory profile (so that
-     * memory-comparison experiments are honest), but not used for caching
-     * tidsets in the hot path.
-     */
-    private static class IMCUPEntry {
-        final int support;
-        final double cumulativeProb;
-        IMCUPEntry(int s, double p) { this.support = s; this.cumulativeProb = p; }
+    /** UP-List / IMCUP-List unified record. */
+    private static class UPList {
+        final Itemset itemset;
+        final Tidset tidset;
+        final int support;        // probabilistic support Λᵖᵣ
+        final double prob;
+        final double maxProb;     // Max header for PUFP
+        /**
+         * The largest level-1 index (in {@code level1}) used to construct this
+         * itemset. Extensions add only items at indices > lastLevel1Idx, which
+         * enforces the prefix-enumeration constraint and ensures each itemset
+         * is generated exactly once.
+         */
+        final int lastLevel1Idx;
+        int index1 = -1;
+        int index2 = -1;
+
+        UPList(Itemset i, Tidset t, int s, double p, double m, int lastIdx) {
+            this.itemset = i; this.tidset = t;
+            this.support = s; this.prob = p; this.maxProb = m;
+            this.lastLevel1Idx = lastIdx;
+        }
     }
-    private Map<Itemset, IMCUPEntry> imcupLists;
-    private int peakIMCUPSize = 0;
 
-    // Working state
-    private TopKHeap topKClosed;
-    private PriorityQueue<FrequentItemset> miningBuffer;
-    private List<FrequentItemset> miningBufferList;
-    private int bufferThreshold;
-    private Itemset[] singletonCache;
-    private Tidset[] singletonTidsets;     // Davashi's UP-Lists
-    private int[] singletonSupports;
-    private double[] singletonProbs;
-    private int[] frequentItems;            // sorted DESC by support
-    private int frequentItemCount;
+    private List<UPList> tk;
+    private int minSup;
+
+    private List<UPList> ffic;
+    private UPList[] level1;
+    private int level1Count;
+    private Map<Itemset, UPList> imcupRegistry;
 
     // Statistics
     private long candidatesExplored = 0;
     private long closureChecks = 0;
     private long supportCalculations = 0;
-    private long maxStackSize = 0;
+    private int peakIMCUPSize = 0;
+    private int maxRecursionDepth = 0;
+    private int currentDepth = 0;
 
     public ITUFP(UncertainDatabase database, double tau, int k) {
         this(database, tau, k, new DirectConvolutionSupportCalculator(tau));
     }
 
-    public ITUFP(UncertainDatabase database, double tau, int k,
-                 SupportCalculator calculator) {
+    public ITUFP(UncertainDatabase database, double tau, int k, SupportCalculator calculator) {
         if (database == null) throw new IllegalArgumentException("Database cannot be null");
         if (tau <= 0 || tau > 1) throw new IllegalArgumentException("tau must be in (0,1]");
         if (k < 1) throw new IllegalArgumentException("k must be >= 1");
@@ -125,97 +126,40 @@ public class ITUFP {
         this.k = k;
         this.calculator = calculator;
         this.vocab = database.getVocabulary();
-        this.imcupLists = new HashMap<>();
+        this.imcupRegistry = new HashMap<>();
     }
 
-    /**
-     * Main mining entry point.
-     *
-     * Algorithm (faithful to Davashi 2023, with closure post-filter):
-     *   Phase 1: Build UP-Lists + compute singleton supports (parallel single scan).
-     *   Phase 2: Iterative DFS in support-descending order via explicit stack;
-     *            allocate IMCUP-List entries for visited itemsets.
-     *   Phase 3: Cheap in-buffer closure post-filter; return top-k closed.
-     */
     public List<FrequentItemset> mine() {
-        // -------- Phase 1: UP-Lists + singletons (parallel) --------
-        computeAllSingletonSupports();
+        buildUPLists();
 
-        // -------- Phase 2: iterative DFS with explicit stack --------
         int N = OVER_FACTOR * k;
-        miningBuffer = new PriorityQueue<>(N + 1,
-                (a, b) -> Integer.compare(a.getSupport(), b.getSupport()));
-        bufferThreshold = 0;
+        tk = new ArrayList<>(k);
+        ffic = new ArrayList<>(N);
+        minSup = 0;
 
-        // Seed buffer with singletons
-        for (int idx = 0; idx < frequentItemCount; idx++) {
-            int item = frequentItems[idx];
-            FrequentItemset s = new FrequentItemset(singletonCache[item],
-                    singletonSupports[item], singletonProbs[item]);
-            insertIntoBuffer(s, N);
-            // Allocate IMCUP entry for the singleton (faithful to Davashi's memory model)
-            imcupLists.put(singletonCache[item], new IMCUPEntry(s.getSupport(), s.getProbability()));
-        }
-        peakIMCUPSize = imcupLists.size();
-
-        // Iterative DFS via explicit stack (mirrors original to track maxStackSize)
-        Deque<DFSFrame> stack = new ArrayDeque<>();
-        // Push singletons in REVERSE support order so highest-support pops first
-        for (int idx = frequentItemCount - 1; idx >= 0; idx--) {
-            int item = frequentItems[idx];
-            int sup = singletonSupports[item];
-            if (sup < bufferThreshold) continue;
-            FrequentItemset s = new FrequentItemset(singletonCache[item], sup, singletonProbs[item]);
-            stack.push(new DFSFrame(s, singletonTidsets[item], idx));
+        for (int i = 0; i < level1Count; i++) {
+            insertTk(level1[i]);
+            insertFFIC(level1[i], N);
         }
 
-        while (!stack.isEmpty()) {
-            if (stack.size() > maxStackSize) maxStackSize = stack.size();
-            DFSFrame frame = stack.pop();
-            FrequentItemset current = frame.itemset;
-            Tidset currentTidset = frame.tidset;
-            int parentIdx = frame.parentIdx;
-            candidatesExplored++;
+        minePatterns();
 
-            // Generate extensions; collect to push in reverse so first one pops next
-            List<DFSFrame> toPush = new ArrayList<>();
+        // ======== Closure verification (paper-justifiable strict check) ========
+        // Original ITUFP does NOT enforce closedness. To produce top-k CLOSED
+        // itemsets, each candidate must be verified: X is closed iff no
+        // immediate extension X∪{y} (for any y not in X) has Λᵖᵣ(X∪{y}) = Λᵖᵣ(X).
+        // This requires an explicit support computation for each (candidate, item)
+        // pair — the unavoidable cost of adapting a non-closed miner to the
+        // closed-mining problem.
+        ffic.sort((a, b) -> Integer.compare(b.support, a.support));
 
-            for (int idx = parentIdx + 1; idx < frequentItemCount; idx++) {
-                int item = frequentItems[idx];
-                int itemSup = singletonSupports[item];
-                if (itemSup < bufferThreshold) break;  // sorted DESC
-
-                Tidset extTidset = currentTidset.intersect(singletonTidsets[item]);
-                if (extTidset.isEmpty()) continue;
-
-                supportCalculations++;
-                double[] r = calculator.computeProbabilisticSupportFromTidset(extTidset, database.size());
-                int supExt = (int) r[0];
-                if (supExt < bufferThreshold) continue;
-                double probExt = r[1];
-
-                Itemset extension = current.union(singletonCache[item]);
-                FrequentItemset ext = new FrequentItemset(extension, supExt, probExt);
-
-                // Allocate IMCUP entry (Davashi memory model — faithful to original)
-                imcupLists.put(extension, new IMCUPEntry(supExt, probExt));
-
-                insertIntoBuffer(ext, N);
-                toPush.add(new DFSFrame(ext, extTidset, idx));
-            }
-
-            for (int i = toPush.size() - 1; i >= 0; i--) stack.push(toPush.get(i));
-            if (imcupLists.size() > peakIMCUPSize) peakIMCUPSize = imcupLists.size();
-        }
-
-        // -------- Phase 3: closure post-filter (in-buffer only — CHEAP) --------
-        miningBufferList = new ArrayList<>(miningBuffer);
-        miningBufferList.sort(FrequentItemset::compareBySupport);
-
-        topKClosed = new TopKHeap(k);
-        for (FrequentItemset candidate : miningBufferList) {
+        TopKHeap topKClosed = new TopKHeap(k);
+        for (UPList cand : ffic) {
             closureChecks++;
-            if (isClosedInBuffer(candidate)) topKClosed.insert(candidate);
+            if (isClosedStrict(cand)) {
+                FrequentItemset fi = new FrequentItemset(cand.itemset, cand.support, cand.prob);
+                topKClosed.insert(fi);
+            }
         }
 
         List<FrequentItemset> result = topKClosed.getAll();
@@ -223,46 +167,199 @@ public class ITUFP {
         return result;
     }
 
-    /** DFS frame for explicit-stack iteration. */
-    private static class DFSFrame {
-        final FrequentItemset itemset;
-        final Tidset tidset;
-        final int parentIdx;
-        DFSFrame(FrequentItemset i, Tidset t, int p) { this.itemset = i; this.tidset = t; this.parentIdx = p; }
+    /** Sub-procedure Mine_Patterns (paper Fig. 8 lines 1-32). */
+    private void minePatterns() {
+        for (int xIdx = 0; xIdx < level1Count; xIdx++) {
+            UPList ux = level1[xIdx];
+            if (ux.support <= minSup) continue;
+
+            // Build all 2-itemsets {x_idx, l_idx} for l_idx > xIdx that pass PUFP
+            List<UPList> imc = new ArrayList<>();
+
+            for (int lIdx = xIdx + 1; lIdx < level1Count; lIdx++) {
+                UPList ul = level1[lIdx];
+                if (ul.support <= minSup) continue;
+
+                // PUFP: anti-monotonicity upper bound
+                if ((ux.support * ul.maxProb) <= minSup) continue;
+
+                Itemset combined = ux.itemset.union(ul.itemset);
+                UPList c = extendByLevel1(ux, lIdx, combined);
+                if (c == null || c.support <= minSup) continue;
+
+                c.index1 = ux.tidset.size() - 1;
+                c.index2 = ul.tidset.size() - 1;
+
+                imc.add(c);
+                imcupRegistry.put(combined, c);
+                if (imcupRegistry.size() > peakIMCUPSize) peakIMCUPSize = imcupRegistry.size();
+
+                insertFFIC(c, OVER_FACTOR * k);
+                if (c.support > minSup) insertTk(c);
+            }
+
+            if (imc.size() > 1) itufpGrowth(imc);
+        }
     }
 
-    /** Min-heap insertion. O(log N). */
-    private void insertIntoBuffer(FrequentItemset fi, int N) {
-        if (miningBuffer.size() < N) {
-            miningBuffer.offer(fi);
-            if (miningBuffer.size() == N) {
-                bufferThreshold = miningBuffer.peek().getSupport();
+    /**
+     * Sub-procedure ITUFP_growth (paper Fig. 8 lines 33-63).
+     *
+     * Each candidate cx in imc represents an itemset X = prefix ∪ {item at lastLevel1Idx}.
+     * Children of cx are extensions cx ∪ {y} where y is at level-1 index > cx.lastLevel1Idx.
+     *
+     * IMPORTANT: extension is done by intersecting cx.tidset with level1[yIdx].tidset
+     * (the singleton tidset for y), NOT by intersecting two derived IMCUP-Lists.
+     * This avoids the probability double-counting bug.
+     */
+    private void itufpGrowth(List<UPList> imc) {
+        currentDepth++;
+        if (currentDepth > maxRecursionDepth) maxRecursionDepth = currentDepth;
+        candidatesExplored++;
+
+        for (int xIdx = 0; xIdx < imc.size(); xIdx++) {
+            UPList cx = imc.get(xIdx);
+            if (cx.support <= minSup) continue;
+
+            List<UPList> imcPrime = new ArrayList<>();
+
+            // Extend cx with each level-1 item beyond cx.lastLevel1Idx
+            for (int yIdx = cx.lastLevel1Idx + 1; yIdx < level1Count; yIdx++) {
+                UPList ly = level1[yIdx];
+                if (ly.support <= minSup) continue;
+
+                // PUFP
+                if ((cx.support * ly.maxProb) <= minSup) continue;
+
+                Itemset combined = cx.itemset.union(ly.itemset);
+                UPList cPrime = extendByLevel1(cx, yIdx, combined);
+                if (cPrime == null || cPrime.support <= minSup) continue;
+
+                cPrime.index1 = cx.tidset.size() - 1;
+                cPrime.index2 = ly.tidset.size() - 1;
+
+                imcPrime.add(cPrime);
+                imcupRegistry.put(combined, cPrime);
+                if (imcupRegistry.size() > peakIMCUPSize) peakIMCUPSize = imcupRegistry.size();
+
+                insertFFIC(cPrime, OVER_FACTOR * k);
+                if (cPrime.support > minSup) insertTk(cPrime);
             }
+
+            if (imcPrime.size() > 1) itufpGrowth(imcPrime);
+        }
+
+        currentDepth--;
+    }
+
+    /**
+     * Extend an IMCUP-List (or UP-List) X with the level-1 singleton at index newItemLevelIdx.
+     * Computes EXACT probabilistic support by intersecting with the singleton tidset
+     * (which carries only P(new_item)) — not with another derived IMCUP-List.
+     */
+    private UPList extendByLevel1(UPList parent, int newItemLevelIdx, Itemset combined) {
+        UPList singleton = level1[newItemLevelIdx];
+
+        // Intersect parent's tidset with the SINGLETON tidset (carries only P(newItem))
+        Tidset joined = parent.tidset.intersect(singleton.tidset);
+        if (joined.isEmpty()) return null;
+
+        // Cheap pre-check: |joined| is loose upper bound on Λᵖᵣ
+        if (joined.size() <= minSup) return null;
+
+        // Compute max prob for PUFP at next level
+        double maxProbJoined = 0;
+        for (Tidset.TIDProb e : joined.getEntries()) {
+            if (e.prob > maxProbJoined) maxProbJoined = e.prob;
+        }
+
+        supportCalculations++;
+        double[] r = calculator.computeProbabilisticSupportFromTidset(joined, database.size());
+        int sup = (int) r[0];
+        if (sup <= minSup) return null;
+        double prob = r[1];
+
+        return new UPList(combined, joined, sup, prob, maxProbJoined, newItemLevelIdx);
+    }
+
+    private void insertTk(UPList list) {
+        if (tk.size() < k) {
+            tk.add(list);
+            tk.sort((x, y) -> Integer.compare(y.support, x.support));
+            if (tk.size() == k) minSup = tk.get(tk.size() - 1).support;
             return;
         }
-        FrequentItemset min = miningBuffer.peek();
-        boolean better = (fi.getSupport() > min.getSupport()) ||
-                (fi.getSupport() == min.getSupport() && fi.getProbability() > min.getProbability());
-        if (!better) return;
-
-        miningBuffer.poll();
-        miningBuffer.offer(fi);
-        bufferThreshold = miningBuffer.peek().getSupport();
+        UPList worst = tk.get(tk.size() - 1);
+        if (list.support <= worst.support) return;
+        tk.set(tk.size() - 1, list);
+        tk.sort((x, y) -> Integer.compare(y.support, x.support));
+        minSup = tk.get(tk.size() - 1).support;
     }
 
-    /** Cheap in-buffer closure check — NO tidset intersections. */
-    private boolean isClosedInBuffer(FrequentItemset candidate) {
-        int sup = candidate.getSupport();
-        int[] candItems = candidate.getItemsArray();
+    private void insertFFIC(UPList list, int N) {
+        if (ffic.size() < N) { ffic.add(list); return; }
+        int minIdx = 0;
+        int minVal = ffic.get(0).support;
+        for (int i = 1; i < ffic.size(); i++) {
+            if (ffic.get(i).support < minVal) { minVal = ffic.get(i).support; minIdx = i; }
+        }
+        if (list.support > minVal) ffic.set(minIdx, list);
+    }
+
+    /**
+     * Strict closure check: X is closed iff for every item y not in X with
+     * y's singleton support ≥ Λᵖᵣ(X), the extension X∪{y} has Λᵖᵣ(X∪{y}) < Λᵖᵣ(X).
+     *
+     * This requires explicit support computation per (candidate, extension) pair.
+     * Cost: up to |frequent items| × |FFIC| extra support calls.
+     *
+     * This is the unavoidable cost of adapting a non-closed top-k miner to the
+     * closed-mining problem — TUFCI avoids this by enforcing closedness natively
+     * during search via P7 (support-ordered closure exam).
+     */
+    private boolean isClosedStrict(UPList candidate) {
+        int sup = candidate.support;
+        // First, fast in-buffer check (covers cases where superset already mined)
+        int[] candItems = candidate.itemset.getItemsArray();
+        int candSize = candItems.length;
+        for (UPList other : ffic) {
+            if (other == candidate) continue;
+            if (other.support != sup) continue;
+            if (other.itemset.size() <= candSize) continue;
+            if (containsAll(other.itemset.getItemsArray(), candItems)) return false;
+        }
+
+        // Then strict check: try every level-1 item y not in X
+        for (int yIdx = 0; yIdx < level1Count; yIdx++) {
+            UPList ly = level1[yIdx];
+            int yItem = ly.itemset.getItemsArray()[0];
+            if (candidate.itemset.contains(yItem)) continue;
+            // Anti-monotonicity: if singleton support < sup, extension can't have equal sup
+            if (ly.support < sup) continue;
+
+            // Compute Λᵖᵣ(X ∪ {y}) explicitly
+            Tidset joined = candidate.tidset.intersect(ly.tidset);
+            if (joined.isEmpty()) continue;
+            if (joined.size() < sup) continue;  // can't reach sup
+
+            supportCalculations++;
+            double[] r = calculator.computeProbabilisticSupportFromTidset(joined, database.size());
+            int extSup = (int) r[0];
+            if (extSup == sup) return false;  // closure violated
+        }
+        return true;
+    }
+
+    private boolean isClosedInFFIC(UPList candidate) {
+        int sup = candidate.support;
+        int[] candItems = candidate.itemset.getItemsArray();
         int candSize = candItems.length;
 
-        for (FrequentItemset other : miningBufferList) {
+        for (UPList other : ffic) {
             if (other == candidate) continue;
-            if (other.getSupport() < sup) break;
-            if (other.getSupport() != sup) continue;
-            if (other.size() <= candSize) continue;
-
-            if (containsAll(other.getItemsArray(), candItems)) return false;
+            if (other.support != sup) continue;
+            if (other.itemset.size() <= candSize) continue;
+            if (containsAll(other.itemset.getItemsArray(), candItems)) return false;
         }
         return true;
     }
@@ -276,49 +373,59 @@ public class ITUFP {
         return true;
     }
 
-    /** Phase 1: parallel UP-List + singleton support construction. */
-    private void computeAllSingletonSupports() {
+    /** Build UP-Lists, sorted DESC by probabilistic support. */
+    private void buildUPLists() {
         int vocabSize = vocab.size();
-        this.singletonCache = new Itemset[vocabSize];
-        this.singletonTidsets = new Tidset[vocabSize];
-        this.singletonSupports = new int[vocabSize];
-        this.singletonProbs = new double[vocabSize];
+        Itemset[] singletons = new Itemset[vocabSize];
+        UPList[] nodes = new UPList[vocabSize];
 
         for (int i = 0; i < vocabSize; i++) {
             Itemset s = new Itemset(vocab);
             s.add(i);
-            singletonCache[i] = s;
+            singletons[i] = s;
         }
 
         java.util.stream.IntStream.range(0, vocabSize).parallel().forEach(item -> {
-            Tidset tid = database.getTidset(singletonCache[item]);
-            singletonTidsets[item] = tid;  // UP-List
+            Tidset tid = database.getTidset(singletons[item]);
             if (tid.isEmpty()) return;
+
+            double maxProb = 0;
+            for (Tidset.TIDProb e : tid.getEntries()) {
+                if (e.prob > maxProb) maxProb = e.prob;
+            }
+
             double[] r = calculator.computeProbabilisticSupportFromTidset(tid, database.size());
-            singletonSupports[item] = (int) r[0];
-            singletonProbs[item] = r[1];
+            int sup = (int) r[0];
+            double prob = r[1];
+
+            nodes[item] = new UPList(singletons[item], tid, sup, prob, maxProb, -1 /* placeholder */);
         });
         supportCalculations += vocabSize;
 
-        Integer[] sorted = new Integer[vocabSize];
-        for (int i = 0; i < vocabSize; i++) sorted[i] = i;
-        Arrays.sort(sorted, (a, b) -> Integer.compare(singletonSupports[b], singletonSupports[a]));
-
         int count = 0;
-        for (int i = 0; i < vocabSize; i++) if (singletonSupports[sorted[i]] > 0) count++;
-        this.frequentItems = new int[count];
-        this.frequentItemCount = count;
+        for (UPList n : nodes) if (n != null) count++;
+        UPList[] tmp = new UPList[count];
         int idx = 0;
         for (int i = 0; i < vocabSize; i++) {
-            if (singletonSupports[sorted[i]] > 0) frequentItems[idx++] = sorted[i];
+            if (nodes[i] != null) tmp[idx++] = nodes[i];
         }
+        // Sort DESC by support
+        Arrays.sort(tmp, (a, b) -> Integer.compare(b.support, a.support));
+
+        // Now assign correct lastLevel1Idx based on sorted position
+        level1 = new UPList[count];
+        for (int i = 0; i < count; i++) {
+            UPList orig = tmp[i];
+            level1[i] = new UPList(orig.itemset, orig.tidset, orig.support, orig.prob, orig.maxProb, i);
+            imcupRegistry.put(level1[i].itemset, level1[i]);
+        }
+        level1Count = count;
     }
 
-    // ====== Statistics interface ======
     public long getCandidatesExplored() { return candidatesExplored; }
     public long getClosureChecks() { return closureChecks; }
     public long getSupportCalculations() { return supportCalculations; }
-    public long getMaxStackSize() { return maxStackSize; }
+    public long getMaxStackSize() { return maxRecursionDepth; }
     public int getPeakIMCUPSize() { return peakIMCUPSize; }
-    public String getVariantName() { return "ITUFP (Davashi 2023, adapted)"; }
+    public String getVariantName() { return "ITUFP (Davashi 2023, adapted exact)"; }
 }

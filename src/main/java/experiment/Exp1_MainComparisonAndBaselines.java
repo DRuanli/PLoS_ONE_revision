@@ -34,17 +34,19 @@ public class Exp1_MainComparisonAndBaselines {
 
     private static final String OUT_DIR = "results/exp1";
     private static final double TAU = 0.7;
-    private static final int[] K_VALUES = { 5,10 };
+    private static final int[] K_VALUES = { 10 };
     private static final int WARMUP = 2;
     private static final int REPS = 5;
 
     private static final String[] DATASETS = {
-            "processed_data/chess_uncertain.txt"
+            "processed_data/chess_uncertain.txt",
+            "processed_data/mushrooms_uncertain.txt"
     };
 
     private static final String[] ALGORITHMS = {
             "V1_BFS_Full", "V2_DFS_Full", "V3_BFS_Search", "V4_DFS_Search",
-            "TopKPFIM", "ITUFP"
+            "TopKPFIM",
+            "ITUFP"
     };
 
     public static void main(String[] args) throws Exception {
